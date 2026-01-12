@@ -1,0 +1,398 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Live Stock Signal Tool</title>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/recharts@2.5.0/dist/Recharts.js"></script>
+  <script src="https://unpkg.com/lucide-react@0.263.1/dist/umd/lucide-react.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+  
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+    const { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, ReferenceDot } = Recharts;
+    const { TrendingUp, TrendingDown, Activity, RefreshCw } = lucideReact;
+
+    const StockSignalTool = () => {
+      const [symbol, setSymbol] = useState('QQQ');
+      const [candleData, setCandleData] = useState([]);
+      const [signals, setSignals] = useState([]);
+      const [loading, setLoading] = useState(false);
+      const [error, setError] = useState('');
+      const [lastUpdate, setLastUpdate] = useState(null);
+      const [stats, setStats] = useState({ ema9: 0, ema21: 0, momentum: 0, slope: 0 });
+      const intervalRef = useRef(null);
+
+      // Calculate EMA
+      const calculateEMA = (data, period) => {
+        const k = 2 / (period + 1);
+        const emaData = [];
+        let ema = data[0];
+        
+        for (let i = 0; i < data.length; i++) {
+          if (i === 0) {
+            ema = data[i];
+          } else {
+            ema = data[i] * k + ema * (1 - k);
+          }
+          emaData.push(ema);
+        }
+        return emaData;
+      };
+
+      // Calculate slope
+      const calculateSlope = (prices) => {
+        const n = prices.length;
+        if (n < 2) return 0;
+        
+        let sumX = 0, sumY = 0, sumXY = 0, sumX2 = 0;
+        
+        for (let i = 0; i < n; i++) {
+          sumX += i;
+          sumY += prices[i];
+          sumXY += i * prices[i];
+          sumX2 += i * i;
+        }
+        
+        const slope = (n * sumXY - sumX * sumY) / (n * sumX2 - sumX * sumX);
+        return slope;
+      };
+
+      // Check momentum
+      const checkMomentum = (prices, index) => {
+        if (index < 16) return { exceeds: false, currentSlope: 0, avgSlope: 0 };
+        
+        const currentPrices = prices.slice(index - 3, index + 1);
+        const currentSlope = calculateSlope(currentPrices);
+        
+        const slopes = [];
+        for (let i = 0; i < 3; i++) {
+          const start = index - 15 + (i * 4);
+          const end = start + 4;
+          const segmentPrices = prices.slice(start, end);
+          slopes.push(calculateSlope(segmentPrices));
+        }
+        
+        const avgSlope = slopes.reduce((a, b) => a + b, 0) / slopes.length;
+        const threshold = Math.abs(avgSlope) * 3;
+        
+        return {
+          exceeds: Math.abs(currentSlope) > threshold && currentSlope > 0,
+          currentSlope,
+          avgSlope
+        };
+      };
+
+      // Detect signals
+      const detectSignals = (data) => {
+        if (data.length < 25) return [];
+        
+        const closes = data.map(d => d.close);
+        const ema9 = calculateEMA(closes, 9);
+        const ema21 = calculateEMA(closes, 21);
+        const detectedSignals = [];
+
+        for (let i = 1; i < data.length; i++) {
+          const prevEma9 = ema9[i - 1];
+          const prevEma21 = ema21[i - 1];
+          const currEma9 = ema9[i];
+          const currEma21 = ema21[i];
+
+          if (prevEma9 <= prevEma21 && currEma9 > currEma21) {
+            const momentumCheck = checkMomentum(closes, i);
+            
+            if (momentumCheck.exceeds) {
+              detectedSignals.push({
+                index: i,
+                type: 'buy',
+                price: data[i].close,
+                time: data[i].datetime,
+                ema9: currEma9,
+                ema21: currEma21,
+                momentum: momentumCheck.currentSlope,
+                avgSlope: momentumCheck.avgSlope
+              });
+            }
+          }
+
+          if (prevEma9 >= prevEma21 && currEma9 < currEma21) {
+            detectedSignals.push({
+              index: i,
+              type: 'sell',
+              price: data[i].close,
+              time: data[i].datetime,
+              ema9: currEma9,
+              ema21: currEma21
+            });
+          }
+        }
+
+        if (ema9.length > 0 && ema21.length > 0) {
+          const lastIdx = ema9.length - 1;
+          const momentumCheck = checkMomentum(closes, lastIdx);
+          setStats({
+            ema9: ema9[lastIdx].toFixed(2),
+            ema21: ema21[lastIdx].toFixed(2),
+            momentum: momentumCheck.currentSlope.toFixed(4),
+            slope: momentumCheck.avgSlope.toFixed(4)
+          });
+        }
+
+        return detectedSignals;
+      };
+
+      // Fetch data
+      const fetchData = async () => {
+        setLoading(true);
+        setError('');
+
+        try {
+          const response = await fetch(`/api/stock-data?symbol=${symbol}&interval=1min&outputsize=100`);
+          
+          if (!response.ok) {
+            const errorData = await response.json();
+            setError(errorData.error || 'Failed to fetch data');
+            setLoading(false);
+            return;
+          }
+
+          const data = await response.json();
+          
+          if (data.status === 'error') {
+            setError(data.message || 'API Error');
+            setLoading(false);
+            return;
+          }
+
+          if (!data.values || data.values.length === 0) {
+            setError('No data received. Market may be closed.');
+            setLoading(false);
+            return;
+          }
+
+          const processedData = data.values.reverse().map((item, idx) => ({
+            datetime: item.datetime,
+            open: parseFloat(item.open),
+            high: parseFloat(item.high),
+            low: parseFloat(item.low),
+            close: parseFloat(item.close),
+            volume: parseInt(item.volume),
+            index: idx
+          }));
+
+          setCandleData(processedData);
+          const detectedSignals = detectSignals(processedData);
+          setSignals(detectedSignals);
+          setLastUpdate(new Date());
+          setLoading(false);
+        } catch (err) {
+          setError('Failed to fetch data: ' + err.message);
+          setLoading(false);
+        }
+      };
+
+      const startAutoRefresh = () => {
+        if (intervalRef.current) {
+          clearInterval(intervalRef.current);
+        }
+        
+        fetchData();
+        intervalRef.current = setInterval(() => {
+          fetchData();
+        }, 120000);
+      };
+
+      const stopAutoRefresh = () => {
+        if (intervalRef.current) {
+          clearInterval(intervalRef.current);
+          intervalRef.current = null;
+        }
+      };
+
+      useEffect(() => {
+        return () => stopAutoRefresh();
+      }, []);
+
+      const getChartData = () => {
+        if (candleData.length < 25) return [];
+        
+        const closes = candleData.map(d => d.close);
+        const ema9 = calculateEMA(closes, 9);
+        const ema21 = calculateEMA(closes, 21);
+
+        const fullData = candleData.map((candle, idx) => ({
+          ...candle,
+          ema9: ema9[idx],
+          ema21: ema21[idx],
+          time: candle.datetime.split(' ')[1]
+        }));
+
+        return fullData.slice(-80);
+      };
+
+      const chartData = getChartData();
+
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 p-6">
+          <div className="max-w-7xl mx-auto">
+            <div className="text-center mb-8">
+              <h1 className="text-4xl font-bold text-white mb-2">Live Stock Signal Tool</h1>
+              <p className="text-slate-400">9 EMA × 21 EMA Crossover + Momentum Strategy</p>
+            </div>
+
+            <div className="bg-slate-800 rounded-lg p-6 mb-6 shadow-xl">
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
+                <div>
+                  <label className="block text-sm font-medium text-slate-300 mb-2">Stock Symbol</label>
+                  <input
+                    type="text"
+                    value={symbol}
+                    onChange={(e) => setSymbol(e.target.value.toUpperCase())}
+                    placeholder="QQQ"
+                    className="w-full px-4 py-2 bg-slate-700 text-white rounded-lg focus:ring-2 focus:ring-blue-500 outline-none"
+                  />
+                </div>
+                <div className="flex items-end gap-2">
+                  <button
+                    onClick={startAutoRefresh}
+                    disabled={loading}
+                    className="flex-1 px-6 py-2 bg-blue-600 hover:bg-blue-700 disabled:bg-slate-600 text-white rounded-lg font-medium transition-colors flex items-center justify-center gap-2"
+                  >
+                    <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
+                    Start Live
+                  </button>
+                  <button
+                    onClick={stopAutoRefresh}
+                    className="px-6 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg font-medium transition-colors"
+                  >
+                    Stop
+                  </button>
+                </div>
+              </div>
+
+              {error && (
+                <div className="bg-red-900/50 border border-red-500 text-red-200 px-4 py-3 rounded-lg mb-4">
+                  {error}
+                </div>
+              )}
+
+              {lastUpdate && (
+                <div className="text-slate-400 text-sm text-center">
+                  Last update: {lastUpdate.toLocaleTimeString()} (Auto-refresh every 2 min)
+                </div>
+              )}
+            </div>
+
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
+              <div className="bg-slate-800 rounded-lg p-4 shadow-xl">
+                <div className="text-slate-400 text-sm mb-1">9 EMA</div>
+                <div className="text-2xl font-bold text-blue-400">${stats.ema9}</div>
+              </div>
+              <div className="bg-slate-800 rounded-lg p-4 shadow-xl">
+                <div className="text-slate-400 text-sm mb-1">21 EMA</div>
+                <div className="text-2xl font-bold text-purple-400">${stats.ema21}</div>
+              </div>
+              <div className="bg-slate-800 rounded-lg p-4 shadow-xl">
+                <div className="text-slate-400 text-sm mb-1">Current Slope</div>
+                <div className="text-2xl font-bold text-green-400">{stats.momentum}</div>
+              </div>
+              <div className="bg-slate-800 rounded-lg p-4 shadow-xl">
+                <div className="text-slate-400 text-sm mb-1">Avg Slope</div>
+                <div className="text-2xl font-bold text-orange-400">{stats.slope}</div>
+              </div>
+            </div>
+
+            {chartData.length > 0 && (
+              <div className="bg-slate-800 rounded-lg p-6 shadow-xl mb-6">
+                <h2 className="text-xl font-bold text-white mb-4">{symbol} - 1 Minute Chart</h2>
+                <ResponsiveContainer width="100%" height={500}>
+                  <LineChart data={chartData}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
+                    <XAxis dataKey="time" stroke="#94a3b8" tick={{ fill: '#94a3b8' }} />
+                    <YAxis domain={['auto', 'auto']} stroke="#94a3b8" tick={{ fill: '#94a3b8' }} />
+                    <Tooltip 
+                      contentStyle={{ backgroundColor: '#1e293b', border: '1px solid #475569', borderRadius: '8px' }}
+                      labelStyle={{ color: '#e2e8f0' }}
+                    />
+                    <Legend />
+                    <Line type="monotone" dataKey="close" stroke="#60a5fa" name="Close Price" strokeWidth={2} dot={false} />
+                    <Line type="monotone" dataKey="ema9" stroke="#3b82f6" name="9 EMA" strokeWidth={2} dot={false} />
+                    <Line type="monotone" dataKey="ema21" stroke="#a78bfa" name="21 EMA" strokeWidth={2} dot={false} />
+                    {signals.map((signal, idx) => (
+                      <ReferenceDot
+                        key={idx}
+                        x={chartData[signal.index]?.time}
+                        y={signal.price}
+                        r={8}
+                        fill={signal.type === 'buy' ? '#10b981' : '#ef4444'}
+                        stroke="#fff"
+                        strokeWidth={2}
+                      />
+                    ))}
+                  </LineChart>
+                </ResponsiveContainer>
+              </div>
+            )}
+
+            {signals.length > 0 && (
+              <div className="bg-slate-800 rounded-lg p-6 shadow-xl">
+                <h2 className="text-xl font-bold text-white mb-4 flex items-center gap-2">
+                  <Activity className="w-5 h-5" />
+                  Detected Signals ({signals.length})
+                </h2>
+                <div className="overflow-x-auto">
+                  <table className="w-full">
+                    <thead>
+                      <tr className="border-b border-slate-700">
+                        <th className="text-left py-3 px-4 text-slate-300 font-medium">Time</th>
+                        <th className="text-left py-3 px-4 text-slate-300 font-medium">Type</th>
+                        <th className="text-right py-3 px-4 text-slate-300 font-medium">Price</th>
+                        <th className="text-right py-3 px-4 text-slate-300 font-medium">9 EMA</th>
+                        <th className="text-right py-3 px-4 text-slate-300 font-medium">21 EMA</th>
+                        <th className="text-right py-3 px-4 text-slate-300 font-medium">Momentum</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {signals.slice().reverse().map((signal, idx) => (
+                        <tr key={idx} className="border-b border-slate-700 hover:bg-slate-700/50">
+                          <td className="py-3 px-4 text-slate-300">{signal.time}</td>
+                          <td className="py-3 px-4">
+                            <span className={`inline-flex items-center gap-1 px-3 py-1 rounded-full text-sm font-medium ${
+                              signal.type === 'buy' ? 'bg-green-500/20 text-green-400' : 'bg-red-500/20 text-red-400'
+                            }`}>
+                              {signal.type === 'buy' ? (
+                                <><TrendingUp className="w-4 h-4" /> BUY</>
+                              ) : (
+                                <><TrendingDown className="w-4 h-4" /> SELL</>
+                              )}
+                            </span>
+                          </td>
+                          <td className="py-3 px-4 text-right text-white font-medium">${signal.price.toFixed(2)}</td>
+                          <td className="py-3 px-4 text-right text-blue-400">${signal.ema9.toFixed(2)}</td>
+                          <td className="py-3 px-4 text-right text-purple-400">${signal.ema21.toFixed(2)}</td>
+                          <td className="py-3 px-4 text-right text-green-400">
+                            {signal.momentum ? signal.momentum.toFixed(4) : '-'}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      );
+    };
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<StockSignalTool />);
+  </script>
+</body>
+</html>
